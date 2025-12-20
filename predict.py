@@ -146,31 +146,68 @@ class Predictor(BasePredictor):
             encoder_hidden_size = sound_tower.hidden_size
             print(f"[~] Sound encoder hidden size: {encoder_hidden_size} dimensions")
 
+            # DEBUG: Check input shapes
+            print(f"[DEBUG] Input sounds shape: {sounds.shape}")
+            print(f"[DEBUG] Input sound_feature_masks shape: {sound_feature_masks.shape}")
+
             # Process through encoder
-            # The sound_tower returns features of shape [batch_size, seq_len, hidden_size]
             raw_features = sound_tower(sounds, sound_feature_masks)
 
-            # Validate the shape
-            if len(raw_features.shape) != 3:
-                raise ValueError(f"Expected raw_features to have 3 dimensions [batch, seq, hidden], got shape {raw_features.shape}")
+            # DEBUG: Check raw features shape
+            print(f"[DEBUG] Raw encoder output shape: {raw_features.shape}")
+            print(f"[DEBUG] Raw encoder output type: {type(raw_features)}")
+            print(f"[DEBUG] Raw encoder output ndim: {raw_features.ndim}")
 
-            batch_size, seq_len, hidden_size = raw_features.shape
-            print(f"[~] Raw encoder features shape: batch={batch_size}, seq_len={seq_len}, hidden={hidden_size}")
+            # The encoder might return features with shape [num_windows, seq_len, hidden_size]
+            # We need to pool across BOTH windows and sequence to get a single vector
+
+            if raw_features.ndim == 3:
+                # Shape: [num_windows, seq_len, hidden_size]
+                # Pool over both windows (dim 0) and sequence (dim 1)
+                num_windows, seq_len, hidden_size = raw_features.shape
+                print(f"[~] Processing {num_windows} audio windows, seq_len={seq_len}, hidden={hidden_size}")
+
+                # First, pool over sequence dimension for each window
+                window_embeddings = raw_features.mean(dim=1)  # Shape: [num_windows, hidden_size]
+                print(f"[DEBUG] After sequence pooling shape: {window_embeddings.shape}")
+
+                # Then, pool over windows to get a single vector
+                final_embedding = window_embeddings.mean(dim=0)  # Shape: [hidden_size]
+                print(f"[DEBUG] After window pooling shape: {final_embedding.shape}")
+
+            elif raw_features.ndim == 2:
+                # Shape: [seq_len, hidden_size] - single window
+                seq_len, hidden_size = raw_features.shape
+                print(f"[~] Processing single window, seq_len={seq_len}, hidden={hidden_size}")
+                final_embedding = raw_features.mean(dim=0)  # Shape: [hidden_size]
+                print(f"[DEBUG] After pooling shape: {final_embedding.shape}")
+
+            else:
+                raise ValueError(f"Unexpected raw_features shape: {raw_features.shape} with {raw_features.ndim} dimensions")
+
+            # Verify we have a 1D tensor
+            if final_embedding.ndim != 1:
+                raise ValueError(f"Expected 1D embedding after pooling, got shape {final_embedding.shape}")
 
             # Verify dimensions match the model config
-            if hidden_size != encoder_hidden_size:
-                raise ValueError(f"Encoder output hidden size {hidden_size} doesn't match expected {encoder_hidden_size}")
-
-            # Apply mean pooling over the sequence dimension to get a single vector
-            pooled_features = raw_features.mean(dim=1)  # Shape: [batch_size, hidden_size]
+            if final_embedding.shape[0] != encoder_hidden_size:
+                raise ValueError(f"Embedding size {final_embedding.shape[0]} doesn't match expected {encoder_hidden_size}")
 
             # Convert to CPU and then to Python list
-            # Take the first (and only) item from the batch
-            embedding_vector = pooled_features[0].cpu().float().tolist()
+            embedding_vector = final_embedding.cpu().float().tolist()
 
-            # Final validation
+            print(f"[DEBUG] Final embedding_vector type: {type(embedding_vector)}")
+            print(f"[DEBUG] Final embedding_vector length: {len(embedding_vector)}")
+            print(f"[DEBUG] First 5 values: {embedding_vector[:5]}")
+
+            # Final validation - must be a flat list
+            if not isinstance(embedding_vector, list):
+                raise ValueError(f"Expected embedding_vector to be a list, got {type(embedding_vector)}")
             if len(embedding_vector) != encoder_hidden_size:
                 raise ValueError(f"Final embedding size {len(embedding_vector)} doesn't match expected {encoder_hidden_size}")
+            # Check it's not nested
+            if any(isinstance(x, (list, tuple)) for x in embedding_vector[:10]):
+                raise ValueError("Embedding vector contains nested lists! This should be a flat 1D array")
 
         return embedding_vector
 
