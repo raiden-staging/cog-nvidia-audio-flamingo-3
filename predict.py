@@ -8,7 +8,7 @@ import torch
 import time
 import subprocess
 import json
-from typing import Optional, List
+from typing import Optional
 from cog import BasePredictor, Input, Path, BaseModel
 from peft import PeftModel
 
@@ -46,9 +46,16 @@ def download_weights(url: str, dest: str) -> None:
 
 
 class ModelOutput(BaseModel):
-    """Output schema for the model prediction"""
-    response: str
-    embeddings_json: str
+    """
+    Output schema - ALWAYS returns an array of results
+
+    results_json: JSON array where each item has:
+        - index: int
+        - embeddings_json: str (JSON with {"vector": [...]} or {"error": "..."})
+        - response: str (text response or "[embeddings_only mode]")
+        - error: str or null
+    """
+    results_json: str
     logs: str
 
 
@@ -105,7 +112,10 @@ class Predictor(BasePredictor):
 
     def extract_audio_embeddings(self, audio_path: str) -> str:
         """
-        Extract audio embeddings - SIMPLE VERSION THAT WORKS
+        Extract audio embeddings using the model's encoder.
+
+        The dimensionality (1280) comes from the AF-Whisper encoder's hidden_size,
+        NOT hardcoded - it's determined by the actual model architecture.
 
         Returns JSON with either {"vector": [...]} or {"error": "..."}
         """
@@ -124,6 +134,8 @@ class Predictor(BasePredictor):
 
             with torch.no_grad():
                 # Get encoder output (before mm_projector)
+                # This returns features with shape [..., hidden_size]
+                # where hidden_size is determined by the encoder architecture (1280 for AF-Whisper)
                 sound_tower = self.model_single.get_sound_tower()
                 features = sound_tower(sounds, masks)
 
@@ -151,24 +163,124 @@ class Predictor(BasePredictor):
                 if len(vec) > 10000:
                     return json.dumps({"error": f"Too large: {len(vec)} dims"})
 
-                # Check first element
-                if isinstance(vec[0], (list, tuple)):
+                # Check first element to detect nested structures
+                if len(vec) > 0 and isinstance(vec[0], (list, tuple)):
                     return json.dumps({"error": "Nested structure detected"})
 
-                # Success
+                # Success - return vector with its actual dimensionality
                 return json.dumps({"vector": vec})
 
         except Exception as e:
             import traceback
             return json.dumps({"error": str(e), "trace": traceback.format_exc()})
 
+    def download_audio_from_url(self, url: str) -> str:
+        """Download audio from URL to temp file and return path"""
+        import tempfile
+        import urllib.request
+
+        # Create temp file with appropriate extension
+        ext = ".wav"
+        if url.lower().endswith(".mp3"):
+            ext = ".mp3"
+        elif url.lower().endswith(".m4a"):
+            ext = ".m4a"
+        elif url.lower().endswith(".flac"):
+            ext = ".flac"
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        temp_path = temp_file.name
+        temp_file.close()
+
+        # Download
+        urllib.request.urlretrieve(url, temp_path)
+        return temp_path
+
+    def process_single_audio(
+        self,
+        audio_path: str,
+        prompt: str,
+        system_prompt: str,
+        enable_thinking: bool,
+        temperature: float,
+        max_length: int,
+        embeddings_only: bool,
+        item_index: int
+    ) -> dict:
+        """
+        Process a single audio file and return result dict.
+
+        Returns dict with:
+        - index: int
+        - embeddings_json: str (JSON with vector or error)
+        - response: str (text response or "[embeddings_only mode]")
+        - error: str or None
+        """
+        result = {
+            "index": item_index,
+            "embeddings_json": None,
+            "response": None,
+            "error": None
+        }
+
+        try:
+            # STEP 1: Extract embeddings (always done)
+            result["embeddings_json"] = self.extract_audio_embeddings(audio_path)
+
+            # STEP 2: If embeddings_only, we're done
+            if embeddings_only:
+                result["response"] = "[embeddings_only mode]"
+                return result
+
+            # STEP 3: Generate text response
+            sound = llava.Sound(audio_path)
+
+            # Prepare generation config
+            generation_config = copy.deepcopy(self.generation_config_single)
+
+            if max_length > 0:
+                generation_config.max_new_tokens = max_length
+
+            if temperature > 0:
+                generation_config.temperature = temperature
+                generation_config.do_sample = True
+
+            # Construct prompt
+            if system_prompt.strip():
+                full_prompt = f"<sound>\n{system_prompt.strip()}\n\n{prompt}"
+            else:
+                full_prompt = f"<sound>\n{prompt}"
+
+            # Generate
+            if enable_thinking:
+                response = self.model_think.generate_content(
+                    [sound, full_prompt],
+                    generation_config=generation_config
+                )
+            else:
+                response = self.model_single_copy.generate_content(
+                    [sound, full_prompt],
+                    generation_config=generation_config
+                )
+
+            result["response"] = response
+            return result
+
+        except Exception as e:
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            result["error"] = error_msg
+            result["embeddings_json"] = json.dumps({"error": str(e)})
+            result["response"] = "[error during processing]"
+            return result
+
     def predict(
         self,
-        audio: Path = Input(
-            description="Audio file to analyze. Supports speech, music, and sound effects. Maximum duration: 10 minutes."
+        audio_files: str = Input(
+            description='JSON array of audio file URLs or paths. Example: ["https://example.com/audio1.mp3", "https://example.com/audio2.wav"]. Accepts http/https URLs or local paths.'
         ),
         prompt: str = Input(
-            description="Question or instruction about the audio",
+            description="Question or instruction about the audio. Applied to all audio files.",
             default="Please describe this audio in detail."
         ),
         system_prompt: str = Input(
@@ -191,99 +303,145 @@ class Predictor(BasePredictor):
             ge=0,
             le=2048
         ),
-        start_time: Optional[float] = Input(
-            description="Start time in seconds for audio segment analysis (optional). Useful for long audio files.",
-            default=None
-        ),
-        end_time: Optional[float] = Input(
-            description="End time in seconds for audio segment analysis (optional). Must be greater than start_time.",
-            default=None
-        ),
         embeddings_only: bool = Input(
-            description="If True, only return the audio embeddings without generating a text response. Useful for embedding-based tasks.",
+            description="If True, only return audio embeddings without generating text responses. Applies to all audio files.",
             default=False
         ),
     ) -> ModelOutput:
-        """Analyze audio using Audio Flamingo 3 - supports speech, music, and sound analysis up to 10 minutes"""
+        """
+        Analyze audio using Audio Flamingo 3.
 
-        # Validate audio segment timing
-        if start_time is not None and start_time < 0:
-            raise ValueError("start_time must be non-negative")
-        if end_time is not None and end_time < 0:
-            raise ValueError("end_time must be non-negative")
-        if start_time is not None and end_time is not None:
-            if end_time <= start_time:
-                raise ValueError("end_time must be greater than start_time")
+        Input: JSON array of audio URLs/paths
+        Output: JSON array of results (one per input audio)
 
-        # Extract embeddings
-        embeddings_json = self.extract_audio_embeddings(str(audio))
+        All audio files share the same prompt and parameters.
+        """
 
-        # Parse to add to logs
         logs_lines = []
-        try:
-            parsed = json.loads(embeddings_json)
-            if "vector" in parsed:
-                logs_lines.append(f"Embeddings extracted: {len(parsed['vector'])} dimensions")
-            elif "error" in parsed:
-                logs_lines.append(f"Embedding extraction error: {parsed['error']}")
-        except:
-            logs_lines.append("Could not parse embeddings_json")
+        results = []
 
-        # If embeddings_only mode, return early
-        if embeddings_only:
+        try:
+            # Parse audio_files JSON array
+            audio_urls = json.loads(audio_files)
+
+            # Validate it's a list
+            if not isinstance(audio_urls, list):
+                raise ValueError("audio_files must be a JSON array")
+
+            if len(audio_urls) == 0:
+                raise ValueError("audio_files array is empty")
+
+            logs_lines.append(f"Processing {len(audio_urls)} audio file(s)")
+
+            # Process each audio file
+            for idx, url in enumerate(audio_urls):
+                logs_lines.append(f"[{idx+1}/{len(audio_urls)}] Processing: {url[:80]}...")
+
+                audio_path = None
+                try:
+                    # Download or use local path
+                    if url.startswith("http://") or url.startswith("https://"):
+                        audio_path = self.download_audio_from_url(url)
+                        logs_lines.append(f"  Downloaded to: {audio_path}")
+                    else:
+                        audio_path = url
+                        logs_lines.append(f"  Using local path: {audio_path}")
+
+                    # Process this audio
+                    item_result = self.process_single_audio(
+                        audio_path=audio_path,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        enable_thinking=enable_thinking,
+                        temperature=temperature,
+                        max_length=max_length,
+                        embeddings_only=embeddings_only,
+                        item_index=idx
+                    )
+
+                    # Add to results
+                    results.append(item_result)
+
+                    # Log result
+                    if item_result["error"]:
+                        logs_lines.append(f"  ✗ Error: {item_result['error'][:100]}")
+                    else:
+                        # Parse embeddings to show dims
+                        try:
+                            emb_data = json.loads(item_result["embeddings_json"])
+                            if "vector" in emb_data:
+                                logs_lines.append(f"  ✓ Embeddings: {len(emb_data['vector'])} dims")
+                            elif "error" in emb_data:
+                                logs_lines.append(f"  ✗ Embedding error: {emb_data['error'][:100]}")
+                        except:
+                            logs_lines.append(f"  ? Could not parse embeddings")
+
+                        if not embeddings_only:
+                            resp_len = len(item_result["response"]) if item_result["response"] else 0
+                            logs_lines.append(f"  ✓ Response: {resp_len} chars")
+
+                    # Clean up temp file if we downloaded it
+                    if url.startswith("http") and audio_path and os.path.exists(audio_path):
+                        try:
+                            os.remove(audio_path)
+                        except:
+                            pass
+
+                except Exception as e:
+                    import traceback
+                    error_msg = str(e)
+                    logs_lines.append(f"  ✗ Failed: {error_msg}")
+
+                    # Add error result
+                    results.append({
+                        "index": idx,
+                        "embeddings_json": json.dumps({"error": error_msg}),
+                        "response": "[error]",
+                        "error": error_msg
+                    })
+
+                    # Clean up on error too
+                    if audio_path and os.path.exists(audio_path) and url.startswith("http"):
+                        try:
+                            os.remove(audio_path)
+                        except:
+                            pass
+
+            logs_lines.append(f"Completed: {len(results)}/{len(audio_urls)} items processed")
+
+            # Return results as JSON array
             return ModelOutput(
-                response="[embeddings_only mode - no text response generated]",
-                embeddings_json=embeddings_json,
+                results_json=json.dumps(results, indent=2),
                 logs="\n".join(logs_lines)
             )
 
-        # Create sound object with optional segment timing
-        if start_time is not None or end_time is not None:
-            import librosa
-            import soundfile as sf
-            import tempfile
+        except json.JSONDecodeError as e:
+            error_msg = f"Invalid JSON in audio_files: {str(e)}"
+            logs_lines.append(f"ERROR: {error_msg}")
 
-            y, sr = librosa.load(str(audio))
-            start_sample = int(start_time * sr) if start_time is not None else 0
-            end_sample = int(end_time * sr) if end_time is not None else len(y)
-
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                sf.write(tmp_file.name, y[start_sample:end_sample], sr)
-                sound = llava.Sound(tmp_file.name)
-        else:
-            sound = llava.Sound(str(audio))
-
-        # Prepare generation config
-        generation_config = copy.deepcopy(self.generation_config_single)
-
-        if max_length > 0:
-            generation_config.max_new_tokens = max_length
-
-        if temperature > 0:
-            generation_config.temperature = temperature
-            generation_config.do_sample = True
-
-        # Construct prompt
-        if system_prompt.strip():
-            full_prompt = f"<sound>\n{system_prompt.strip()}\n\n{prompt}"
-        else:
-            full_prompt = f"<sound>\n{prompt}"
-
-        if enable_thinking:
-            response = self.model_think.generate_content(
-                [sound, full_prompt],
-                generation_config=generation_config
-            )
-        else:
-            response = self.model_single_copy.generate_content(
-                [sound, full_prompt],
-                generation_config=generation_config
+            return ModelOutput(
+                results_json=json.dumps([{
+                    "index": 0,
+                    "embeddings_json": json.dumps({"error": error_msg}),
+                    "response": "[json parse error]",
+                    "error": error_msg
+                }]),
+                logs="\n".join(logs_lines)
             )
 
-        logs_lines.append(f"Response generated: {len(response)} characters")
+        except Exception as e:
+            import traceback
+            error_msg = str(e)
+            trace = traceback.format_exc()
+            logs_lines.append(f"ERROR: {error_msg}")
+            logs_lines.append(trace)
 
-        return ModelOutput(
-            response=response,
-            embeddings_json=embeddings_json,
-            logs="\n".join(logs_lines)
-        )
+            return ModelOutput(
+                results_json=json.dumps([{
+                    "index": 0,
+                    "embeddings_json": json.dumps({"error": error_msg}),
+                    "response": "[processing error]",
+                    "error": f"{error_msg}\n{trace}"
+                }]),
+                logs="\n".join(logs_lines)
+            )
