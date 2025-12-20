@@ -47,7 +47,7 @@ def download_weights(url: str, dest: str) -> None:
 class ModelOutput(BaseModel):
     """Output schema for the model prediction"""
     response: Optional[str] = None
-    embeddings_json: str
+    embeddings_json: str = '{"error": "embeddings not extracted"}'
 
 
 class Predictor(BasePredictor):
@@ -280,6 +280,14 @@ class Predictor(BasePredictor):
                 if len(embedding_vector) > 10000:
                     return json.dumps({"error": f"embedding_vector too large: {len(embedding_vector)} dimensions (expected <10k)"})
 
+                # Check JSON string size before returning
+                result_json = json.dumps({"vector": embedding_vector})
+                json_size_mb = len(result_json) / (1024 * 1024)
+                print(f"  - JSON string size: {json_size_mb:.2f} MB")
+
+                if json_size_mb > 10:  # If larger than 10MB, something is very wrong
+                    return json.dumps({"error": f"JSON too large: {json_size_mb:.2f} MB with {len(embedding_vector)} dims. Expected small vector."})
+
                 # Check all elements are numbers
                 if not all(isinstance(x, (int, float)) for x in embedding_vector[:10]):
                     return json.dumps({"error": f"embedding_vector contains non-numeric values: {[type(x) for x in embedding_vector[:10]]}"})
@@ -287,7 +295,7 @@ class Predictor(BasePredictor):
                 print(f"\n[SUCCESS] Valid 1D embedding with {len(embedding_vector)} dimensions")
                 print("="*80 + "\n")
 
-                return json.dumps({"vector": embedding_vector})
+                return result_json
 
         except Exception as e:
             import traceback
@@ -349,12 +357,30 @@ class Predictor(BasePredictor):
                 raise ValueError("end_time must be greater than start_time")
 
         # Extract audio embeddings - returns JSON string
-        print("[~] Extracting audio embeddings...")
-        embeddings_json = self.extract_audio_embeddings(str(audio), start_time, end_time)
+        print("\n" + "="*80)
+        print("STARTING EMBEDDINGS EXTRACTION")
+        print("="*80)
+
+        try:
+            embeddings_json = self.extract_audio_embeddings(str(audio), start_time, end_time)
+            print(f"\n[PREDICT] Got embeddings_json back, type: {type(embeddings_json)}")
+            print(f"[PREDICT] embeddings_json length: {len(embeddings_json)} characters")
+            print(f"[PREDICT] First 200 chars: {embeddings_json[:200]}")
+        except Exception as e:
+            import traceback
+            import json
+            error_trace = traceback.format_exc()
+            print(f"\n[PREDICT ERROR] Exception in extract_audio_embeddings: {e}")
+            print(error_trace)
+            embeddings_json = json.dumps({"error": f"Failed to extract embeddings: {str(e)}"})
 
         # If embeddings_only mode, return just the embeddings JSON
         if embeddings_only:
-            return ModelOutput(embeddings_json=embeddings_json)
+            print(f"\n[PREDICT] Returning embeddings_only mode")
+            print(f"[PREDICT] embeddings_json value: {embeddings_json[:500]}")
+            result = ModelOutput(embeddings_json=embeddings_json)
+            print(f"[PREDICT] Created ModelOutput: {result}")
+            return result
         
         # Create sound object with optional segment timing
         if start_time is not None or end_time is not None:
@@ -410,4 +436,13 @@ class Predictor(BasePredictor):
             )
 
         # Return both response and embeddings JSON
-        return ModelOutput(response=response, embeddings_json=embeddings_json)
+        print(f"\n[PREDICT] Returning response + embeddings mode")
+        print(f"[PREDICT] response length: {len(response)} characters")
+        print(f"[PREDICT] embeddings_json length: {len(embeddings_json)} characters")
+        print(f"[PREDICT] embeddings_json preview: {embeddings_json[:200]}")
+
+        result = ModelOutput(response=response, embeddings_json=embeddings_json)
+        print(f"[PREDICT] Created ModelOutput object")
+        print(f"[PREDICT] result.response: {result.response[:100] if result.response else 'None'}...")
+        print(f"[PREDICT] result.embeddings_json: {result.embeddings_json[:100]}...")
+        return result
