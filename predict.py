@@ -7,8 +7,8 @@ import copy
 import torch
 import time
 import subprocess
-from typing import Optional
-from cog import BasePredictor, Input, Path
+from typing import Optional, List
+from cog import BasePredictor, Input, Path, BaseModel
 from peft import PeftModel
 
 # Set up model cache
@@ -42,6 +42,12 @@ def download_weights(url: str, dest: str) -> None:
         )
         raise
     print("[+] Download completed in: ", time.time() - start, "seconds")
+
+
+class ModelOutput(BaseModel):
+    """Output schema for the model prediction"""
+    response: Optional[str] = None
+    embeddings: List[float]
 
 
 class Predictor(BasePredictor):
@@ -95,6 +101,79 @@ class Predictor(BasePredictor):
         print("[+] Think model loaded successfully")
         print("[+] Model setup complete!")
 
+    def extract_audio_embeddings(self, audio_path: str, start_time: Optional[float] = None, end_time: Optional[float] = None) -> List[float]:
+        """
+        Extract audio embeddings from an audio file.
+
+        Returns a single vector representing the audio content.
+        The embeddings are extracted from the AF-Whisper encoder (before the mm_projector).
+        The dimensionality is determined by the model's sound_tower.hidden_size.
+        """
+        # Create sound object with optional segment timing
+        if start_time is not None or end_time is not None:
+            import librosa
+            import soundfile as sf
+            import tempfile
+
+            y, sr = librosa.load(audio_path)
+            start_sample = int(start_time * sr) if start_time is not None else 0
+            end_sample = int(end_time * sr) if end_time is not None else len(y)
+
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                sf.write(tmp_file.name, y[start_sample:end_sample], sr)
+                sound = llava.Sound(tmp_file.name)
+        else:
+            sound = llava.Sound(audio_path)
+
+        # Extract media and metadata (same as generate_content does)
+        from llava.utils.media import extract_media
+        from llava.mm_utils import process_sounds, process_sound_masks
+
+        # Create a conversation with the sound object
+        conversation = [{"from": "human", "value": [sound]}]
+        media, media_meta = extract_media(conversation, self.model_single.config)
+
+        # Process the sound features and masks
+        sounds = process_sounds(media["sound"]).half()
+        sound_feature_masks = process_sound_masks(media_meta["sound_feature_masks"]).half()
+
+        # Extract raw encoder features (before mm_projector)
+        with torch.no_grad():
+            # Get the sound tower (encoder) and its configuration
+            sound_tower = self.model_single.get_sound_tower()
+
+            # Get the actual hidden size from the model architecture (not hardcoded!)
+            encoder_hidden_size = sound_tower.hidden_size
+            print(f"[~] Sound encoder hidden size: {encoder_hidden_size} dimensions")
+
+            # Process through encoder
+            # The sound_tower returns features of shape [batch_size, seq_len, hidden_size]
+            raw_features = sound_tower(sounds, sound_feature_masks)
+
+            # Validate the shape
+            if len(raw_features.shape) != 3:
+                raise ValueError(f"Expected raw_features to have 3 dimensions [batch, seq, hidden], got shape {raw_features.shape}")
+
+            batch_size, seq_len, hidden_size = raw_features.shape
+            print(f"[~] Raw encoder features shape: batch={batch_size}, seq_len={seq_len}, hidden={hidden_size}")
+
+            # Verify dimensions match the model config
+            if hidden_size != encoder_hidden_size:
+                raise ValueError(f"Encoder output hidden size {hidden_size} doesn't match expected {encoder_hidden_size}")
+
+            # Apply mean pooling over the sequence dimension to get a single vector
+            pooled_features = raw_features.mean(dim=1)  # Shape: [batch_size, hidden_size]
+
+            # Convert to CPU and then to Python list
+            # Take the first (and only) item from the batch
+            embedding_vector = pooled_features[0].cpu().float().tolist()
+
+            # Final validation
+            if len(embedding_vector) != encoder_hidden_size:
+                raise ValueError(f"Final embedding size {len(embedding_vector)} doesn't match expected {encoder_hidden_size}")
+
+        return embedding_vector
+
     def predict(
         self,
         audio: Path = Input(
@@ -132,17 +211,30 @@ class Predictor(BasePredictor):
             description="End time in seconds for audio segment analysis (optional). Must be greater than start_time.",
             default=None
         ),
-    ) -> str:
+        embeddings_only: bool = Input(
+            description="If True, only return the audio embeddings without generating a text response. Useful for embedding-based tasks.",
+            default=False
+        ),
+    ) -> ModelOutput:
         """Analyze audio using Audio Flamingo 3 - supports speech, music, and sound analysis up to 10 minutes"""
-        
+
         # Validate audio segment timing
         if start_time is not None and start_time < 0:
             raise ValueError("start_time must be non-negative")
         if end_time is not None and end_time < 0:
-            raise ValueError("end_time must be non-negative") 
+            raise ValueError("end_time must be non-negative")
         if start_time is not None and end_time is not None:
             if end_time <= start_time:
                 raise ValueError("end_time must be greater than start_time")
+
+        # Extract audio embeddings (1280-dimensional vector)
+        print("[~] Extracting audio embeddings...")
+        embeddings = self.extract_audio_embeddings(str(audio), start_time, end_time)
+        print(f"[+] Extracted embeddings with {len(embeddings)} dimensions")
+
+        # If embeddings_only mode, return just the embeddings
+        if embeddings_only:
+            return ModelOutput(embeddings=embeddings)
         
         # Create sound object with optional segment timing
         if start_time is not None or end_time is not None:
@@ -187,14 +279,15 @@ class Predictor(BasePredictor):
         if enable_thinking:
             # Use thinking model for detailed analysis
             response = self.model_think.generate_content(
-                [sound, full_prompt], 
+                [sound, full_prompt],
                 generation_config=generation_config
             )
         else:
             # Use standard model for faster responses - match app.py
             response = self.model_single_copy.generate_content(
-                [sound, full_prompt], 
+                [sound, full_prompt],
                 generation_config=generation_config
             )
-        
-        return response
+
+        # Return both response and embeddings
+        return ModelOutput(response=response, embeddings=embeddings)
