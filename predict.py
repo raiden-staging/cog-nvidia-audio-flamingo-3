@@ -46,8 +46,9 @@ def download_weights(url: str, dest: str) -> None:
 
 class ModelOutput(BaseModel):
     """Output schema for the model prediction"""
-    response: Optional[str] = None
-    embeddings_json: str = '{"error": "embeddings not extracted"}'
+    response: str
+    embeddings_json: str
+    logs: str
 
 
 class Predictor(BasePredictor):
@@ -112,9 +113,6 @@ class Predictor(BasePredictor):
         import json
 
         try:
-            print("\n" + "="*80)
-            print("DEEP ASSESSMENT: EXTRACTING AUDIO EMBEDDINGS")
-            print("="*80)
 
             # Create sound object with optional segment timing
             if start_time is not None or end_time is not None:
@@ -139,163 +137,66 @@ class Predictor(BasePredictor):
             conversation = [{"from": "human", "value": [sound]}]
             media, media_meta = extract_media(conversation, self.model_single.config)
 
-            print(f"\n[STEP 1] Media extraction complete")
-            print(f"  - media['sound'] type: {type(media['sound'])}")
-            print(f"  - media['sound'] length: {len(media['sound'])}")
-            print(f"  - media['sound'][0] type: {type(media['sound'][0])}")
-
-            # Deep inspection of the structure
-            if isinstance(media["sound"][0], list):
-                print(f"  - media['sound'][0] is a LIST with length: {len(media['sound'][0])}")
-                if len(media["sound"][0]) > 0:
-                    print(f"  - media['sound'][0][0] type: {type(media['sound'][0][0])}")
-                    if isinstance(media["sound"][0][0], list):
-                        print(f"  - media['sound'][0][0] is a LIST with length: {len(media['sound'][0][0])}")
-
             # Process the sound features and masks
-            print(f"\n[STEP 2] Processing sounds and masks...")
-            sounds = process_sounds(media["sound"])
-            print(f"  - After process_sounds type: {type(sounds)}")
-            print(f"  - After process_sounds shape: {sounds.shape if isinstance(sounds, torch.Tensor) else 'NOT A TENSOR'}")
+            sounds = process_sounds(media["sound"]).half()
+            sound_feature_masks = process_sound_masks(media_meta["sound_feature_masks"]).half()
 
-            sounds = sounds.half()
-            print(f"  - After .half() shape: {sounds.shape}")
-
-            sound_feature_masks = process_sound_masks(media_meta["sound_feature_masks"])
-            print(f"  - sound_feature_masks shape: {sound_feature_masks.shape if isinstance(sound_feature_masks, torch.Tensor) else 'NOT A TENSOR'}")
-
-            sound_feature_masks = sound_feature_masks.half()
-
-            # Extract raw encoder features (before mm_projector)
+            # Extract raw encoder features
             with torch.no_grad():
-                print(f"\n[STEP 3] Getting sound tower...")
                 sound_tower = self.model_single.get_sound_tower()
                 encoder_hidden_size = sound_tower.hidden_size
-                print(f"  - Encoder hidden size from config: {encoder_hidden_size}")
-
-                print(f"\n[STEP 4] Calling sound_tower(sounds, masks)...")
-                print(f"  - Input sounds.shape: {sounds.shape}")
-                print(f"  - Input sounds.dtype: {sounds.dtype}")
-                print(f"  - Input masks.shape: {sound_feature_masks.shape}")
 
                 # Call the encoder
                 raw_features = sound_tower(sounds, sound_feature_masks)
 
-                print(f"\n[STEP 5] Analyzing raw encoder output...")
-                print(f"  - Type: {type(raw_features)}")
-
-                # Handle different return types
+                # Handle list output (convert to tensor)
                 if isinstance(raw_features, list):
-                    print(f"  - OUTPUT IS A LIST with {len(raw_features)} elements")
-                    for i, item in enumerate(raw_features):
-                        if isinstance(item, torch.Tensor):
-                            print(f"    - List[{i}] is Tensor with shape: {item.shape}")
-                        else:
-                            print(f"    - List[{i}] is {type(item)}")
+                    if not all(isinstance(item, torch.Tensor) for item in raw_features):
+                        return json.dumps({"error": f"Encoder returned list with non-tensors"})
+                    raw_features = torch.stack(raw_features, dim=0)
 
-                    # Stack the list into a tensor
-                    if all(isinstance(item, torch.Tensor) for item in raw_features):
-                        raw_features = torch.stack(raw_features, dim=0)
-                        print(f"  - Stacked into tensor with shape: {raw_features.shape}")
-                    else:
-                        return json.dumps({"error": f"sound_tower returned list with non-tensor elements: {[type(x) for x in raw_features]}"})
+                if not isinstance(raw_features, torch.Tensor):
+                    return json.dumps({"error": f"Encoder output not a tensor: {type(raw_features)}"})
 
-                elif isinstance(raw_features, torch.Tensor):
-                    print(f"  - OUTPUT IS A TENSOR")
-                    print(f"  - Shape: {raw_features.shape}")
-                    print(f"  - Ndim: {raw_features.ndim}")
-                    print(f"  - Dtype: {raw_features.dtype}")
-                else:
-                    return json.dumps({"error": f"sound_tower returned unexpected type: {type(raw_features)}"})
-
-                # Now we should have a tensor - analyze and pool
-                print(f"\n[STEP 6] Pooling strategy based on shape: {raw_features.shape}")
-
+                # Pool to get single vector based on dimensionality
                 if raw_features.ndim == 4:
-                    # Shape might be [batch, num_windows, seq_len, hidden_size]
-                    batch, num_windows, seq_len, hidden_size = raw_features.shape
-                    print(f"  - 4D tensor: batch={batch}, windows={num_windows}, seq={seq_len}, hidden={hidden_size}")
-                    print(f"  - Pooling: mean over batch, windows, and sequence")
-                    final_embedding = raw_features.mean(dim=[0, 1, 2])  # Pool over all except hidden
-
+                    final_embedding = raw_features.mean(dim=[0, 1, 2])
                 elif raw_features.ndim == 3:
-                    # Shape: [num_windows, seq_len, hidden_size] or [batch, seq_len, hidden]
-                    dim0, dim1, dim2 = raw_features.shape
-                    print(f"  - 3D tensor: dim0={dim0}, dim1={dim1}, dim2={dim2}")
-                    print(f"  - Pooling: mean over dim0 and dim1")
                     final_embedding = raw_features.mean(dim=[0, 1])
-
                 elif raw_features.ndim == 2:
-                    # Shape: [seq_len, hidden_size]
-                    seq_len, hidden_size = raw_features.shape
-                    print(f"  - 2D tensor: seq={seq_len}, hidden={hidden_size}")
-                    print(f"  - Pooling: mean over sequence")
                     final_embedding = raw_features.mean(dim=0)
-
                 elif raw_features.ndim == 1:
-                    # Already a 1D vector
-                    print(f"  - Already 1D with size: {raw_features.shape[0]}")
                     final_embedding = raw_features
-
                 else:
-                    return json.dumps({"error": f"Unexpected tensor dimensionality: {raw_features.ndim} with shape {raw_features.shape}"})
-
-                print(f"\n[STEP 7] After pooling:")
-                print(f"  - final_embedding shape: {final_embedding.shape}")
-                print(f"  - final_embedding ndim: {final_embedding.ndim}")
+                    return json.dumps({"error": f"Unexpected shape: {raw_features.shape}"})
 
                 # Validate 1D
                 if final_embedding.ndim != 1:
-                    return json.dumps({"error": f"After pooling, expected 1D but got shape {final_embedding.shape}"})
+                    return json.dumps({"error": f"Pooling failed: shape {final_embedding.shape}"})
 
-                embedding_size = final_embedding.shape[0]
-                print(f"  - Embedding size: {embedding_size}")
-
-                # Convert to Python list
+                # Convert to list
                 embedding_vector = final_embedding.cpu().float().tolist()
 
-                print(f"\n[STEP 8] Final validation:")
-                print(f"  - Type: {type(embedding_vector)}")
-                print(f"  - Length: {len(embedding_vector)}")
-                print(f"  - First 5 values: {embedding_vector[:5]}")
-
-                # Check for nested structures
-                has_nested = False
-                for i, val in enumerate(embedding_vector[:min(100, len(embedding_vector))]):
-                    if isinstance(val, (list, tuple)):
-                        print(f"  - ERROR: Found nested structure at index {i}: {type(val)}")
-                        has_nested = True
-                        break
-
-                if has_nested:
-                    return json.dumps({"error": f"Embedding contains nested structures! Length: {len(embedding_vector)}, sample: {embedding_vector[:3]}"})
-
-                # Final safety check
+                # Validate
                 if not isinstance(embedding_vector, list):
-                    return json.dumps({"error": f"embedding_vector is not a list, it's {type(embedding_vector)}"})
+                    return json.dumps({"error": f"Not a list: {type(embedding_vector)}"})
 
                 if len(embedding_vector) == 0:
-                    return json.dumps({"error": "embedding_vector is empty!"})
+                    return json.dumps({"error": "Empty embedding"})
 
                 if len(embedding_vector) > 10000:
-                    return json.dumps({"error": f"embedding_vector too large: {len(embedding_vector)} dimensions (expected <10k)"})
+                    return json.dumps({"error": f"Too large: {len(embedding_vector)} dims"})
 
-                # Check JSON string size before returning
-                result_json = json.dumps({"vector": embedding_vector})
-                json_size_mb = len(result_json) / (1024 * 1024)
-                print(f"  - JSON string size: {json_size_mb:.2f} MB")
+                # Check for nested structures
+                if any(isinstance(x, (list, tuple)) for x in embedding_vector[:min(100, len(embedding_vector))]):
+                    return json.dumps({"error": "Nested structures detected"})
 
-                if json_size_mb > 10:  # If larger than 10MB, something is very wrong
-                    return json.dumps({"error": f"JSON too large: {json_size_mb:.2f} MB with {len(embedding_vector)} dims. Expected small vector."})
-
-                # Check all elements are numbers
+                # Check numeric
                 if not all(isinstance(x, (int, float)) for x in embedding_vector[:10]):
-                    return json.dumps({"error": f"embedding_vector contains non-numeric values: {[type(x) for x in embedding_vector[:10]]}"})
+                    return json.dumps({"error": "Non-numeric values found"})
 
-                print(f"\n[SUCCESS] Valid 1D embedding with {len(embedding_vector)} dimensions")
-                print("="*80 + "\n")
-
-                return result_json
+                # Return success
+                return json.dumps({"vector": embedding_vector})
 
         except Exception as e:
             import traceback
@@ -357,30 +258,36 @@ class Predictor(BasePredictor):
                 raise ValueError("end_time must be greater than start_time")
 
         # Extract audio embeddings - returns JSON string
-        print("\n" + "="*80)
-        print("STARTING EMBEDDINGS EXTRACTION")
-        print("="*80)
+        import json
+        logs = []
+
+        logs.append(f"Starting extraction for audio: {audio}")
+        logs.append(f"embeddings_only={embeddings_only}")
 
         try:
             embeddings_json = self.extract_audio_embeddings(str(audio), start_time, end_time)
-            print(f"\n[PREDICT] Got embeddings_json back, type: {type(embeddings_json)}")
-            print(f"[PREDICT] embeddings_json length: {len(embeddings_json)} characters")
-            print(f"[PREDICT] First 200 chars: {embeddings_json[:200]}")
+            logs.append(f"Extraction completed, type: {type(embeddings_json)}, len: {len(embeddings_json) if embeddings_json else 0}")
+
+            if not embeddings_json or not isinstance(embeddings_json, str):
+                logs.append("ERROR: Invalid return from extract_audio_embeddings")
+                embeddings_json = json.dumps({"error": "extract_audio_embeddings returned invalid value"})
+            else:
+                logs.append(f"embeddings_json preview: {embeddings_json[:200]}")
         except Exception as e:
             import traceback
-            import json
-            error_trace = traceback.format_exc()
-            print(f"\n[PREDICT ERROR] Exception in extract_audio_embeddings: {e}")
-            print(error_trace)
-            embeddings_json = json.dumps({"error": f"Failed to extract embeddings: {str(e)}"})
+            trace = traceback.format_exc()
+            logs.append(f"EXCEPTION: {str(e)}")
+            logs.append(f"Traceback: {trace}")
+            embeddings_json = json.dumps({"error": f"Exception: {str(e)}"})
 
         # If embeddings_only mode, return just the embeddings JSON
         if embeddings_only:
-            print(f"\n[PREDICT] Returning embeddings_only mode")
-            print(f"[PREDICT] embeddings_json value: {embeddings_json[:500]}")
-            result = ModelOutput(embeddings_json=embeddings_json)
-            print(f"[PREDICT] Created ModelOutput: {result}")
-            return result
+            logs.append("Returning embeddings_only mode")
+            return ModelOutput(
+                response="[embeddings_only mode]",
+                embeddings_json=embeddings_json,
+                logs="\n".join(logs)
+            )
         
         # Create sound object with optional segment timing
         if start_time is not None or end_time is not None:
@@ -436,13 +343,10 @@ class Predictor(BasePredictor):
             )
 
         # Return both response and embeddings JSON
-        print(f"\n[PREDICT] Returning response + embeddings mode")
-        print(f"[PREDICT] response length: {len(response)} characters")
-        print(f"[PREDICT] embeddings_json length: {len(embeddings_json)} characters")
-        print(f"[PREDICT] embeddings_json preview: {embeddings_json[:200]}")
-
-        result = ModelOutput(response=response, embeddings_json=embeddings_json)
-        print(f"[PREDICT] Created ModelOutput object")
-        print(f"[PREDICT] result.response: {result.response[:100] if result.response else 'None'}...")
-        print(f"[PREDICT] result.embeddings_json: {result.embeddings_json[:100]}...")
-        return result
+        logs.append(f"Generated response, length: {len(response)}")
+        logs.append("Returning both response and embeddings")
+        return ModelOutput(
+            response=response,
+            embeddings_json=embeddings_json,
+            logs="\n".join(logs)
+        )
