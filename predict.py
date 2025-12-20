@@ -47,7 +47,7 @@ def download_weights(url: str, dest: str) -> None:
 class ModelOutput(BaseModel):
     """Output schema for the model prediction"""
     response: Optional[str] = None
-    embeddings: List[float]
+    embeddings_json: str
 
 
 class Predictor(BasePredictor):
@@ -101,115 +101,199 @@ class Predictor(BasePredictor):
         print("[+] Think model loaded successfully")
         print("[+] Model setup complete!")
 
-    def extract_audio_embeddings(self, audio_path: str, start_time: Optional[float] = None, end_time: Optional[float] = None) -> List[float]:
+    def extract_audio_embeddings(self, audio_path: str, start_time: Optional[float] = None, end_time: Optional[float] = None) -> str:
         """
         Extract audio embeddings from an audio file.
 
-        Returns a single vector representing the audio content.
-        The embeddings are extracted from the AF-Whisper encoder (before the mm_projector).
-        The dimensionality is determined by the model's sound_tower.hidden_size.
+        Returns JSON string with either:
+        - {"vector": [...]} if embeddings are reasonable (1D, <10k dims)
+        - {"error": "..."} if something went wrong
         """
-        # Create sound object with optional segment timing
-        if start_time is not None or end_time is not None:
-            import librosa
-            import soundfile as sf
-            import tempfile
+        import json
 
-            y, sr = librosa.load(audio_path)
-            start_sample = int(start_time * sr) if start_time is not None else 0
-            end_sample = int(end_time * sr) if end_time is not None else len(y)
+        try:
+            print("\n" + "="*80)
+            print("DEEP ASSESSMENT: EXTRACTING AUDIO EMBEDDINGS")
+            print("="*80)
 
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                sf.write(tmp_file.name, y[start_sample:end_sample], sr)
-                sound = llava.Sound(tmp_file.name)
-        else:
-            sound = llava.Sound(audio_path)
+            # Create sound object with optional segment timing
+            if start_time is not None or end_time is not None:
+                import librosa
+                import soundfile as sf
+                import tempfile
 
-        # Extract media and metadata (same as generate_content does)
-        from llava.utils.media import extract_media
-        from llava.mm_utils import process_sounds, process_sound_masks
+                y, sr = librosa.load(audio_path)
+                start_sample = int(start_time * sr) if start_time is not None else 0
+                end_sample = int(end_time * sr) if end_time is not None else len(y)
 
-        # Create a conversation with the sound object
-        conversation = [{"from": "human", "value": [sound]}]
-        media, media_meta = extract_media(conversation, self.model_single.config)
-
-        # Process the sound features and masks
-        sounds = process_sounds(media["sound"]).half()
-        sound_feature_masks = process_sound_masks(media_meta["sound_feature_masks"]).half()
-
-        # Extract raw encoder features (before mm_projector)
-        with torch.no_grad():
-            # Get the sound tower (encoder) and its configuration
-            sound_tower = self.model_single.get_sound_tower()
-
-            # Get the actual hidden size from the model architecture (not hardcoded!)
-            encoder_hidden_size = sound_tower.hidden_size
-            print(f"[~] Sound encoder hidden size: {encoder_hidden_size} dimensions")
-
-            # DEBUG: Check input shapes
-            print(f"[DEBUG] Input sounds shape: {sounds.shape}")
-            print(f"[DEBUG] Input sound_feature_masks shape: {sound_feature_masks.shape}")
-
-            # Process through encoder
-            raw_features = sound_tower(sounds, sound_feature_masks)
-
-            # DEBUG: Check raw features shape
-            print(f"[DEBUG] Raw encoder output shape: {raw_features.shape}")
-            print(f"[DEBUG] Raw encoder output type: {type(raw_features)}")
-            print(f"[DEBUG] Raw encoder output ndim: {raw_features.ndim}")
-
-            # The encoder might return features with shape [num_windows, seq_len, hidden_size]
-            # We need to pool across BOTH windows and sequence to get a single vector
-
-            if raw_features.ndim == 3:
-                # Shape: [num_windows, seq_len, hidden_size]
-                # Pool over both windows (dim 0) and sequence (dim 1)
-                num_windows, seq_len, hidden_size = raw_features.shape
-                print(f"[~] Processing {num_windows} audio windows, seq_len={seq_len}, hidden={hidden_size}")
-
-                # First, pool over sequence dimension for each window
-                window_embeddings = raw_features.mean(dim=1)  # Shape: [num_windows, hidden_size]
-                print(f"[DEBUG] After sequence pooling shape: {window_embeddings.shape}")
-
-                # Then, pool over windows to get a single vector
-                final_embedding = window_embeddings.mean(dim=0)  # Shape: [hidden_size]
-                print(f"[DEBUG] After window pooling shape: {final_embedding.shape}")
-
-            elif raw_features.ndim == 2:
-                # Shape: [seq_len, hidden_size] - single window
-                seq_len, hidden_size = raw_features.shape
-                print(f"[~] Processing single window, seq_len={seq_len}, hidden={hidden_size}")
-                final_embedding = raw_features.mean(dim=0)  # Shape: [hidden_size]
-                print(f"[DEBUG] After pooling shape: {final_embedding.shape}")
-
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                    sf.write(tmp_file.name, y[start_sample:end_sample], sr)
+                    sound = llava.Sound(tmp_file.name)
             else:
-                raise ValueError(f"Unexpected raw_features shape: {raw_features.shape} with {raw_features.ndim} dimensions")
+                sound = llava.Sound(audio_path)
 
-            # Verify we have a 1D tensor
-            if final_embedding.ndim != 1:
-                raise ValueError(f"Expected 1D embedding after pooling, got shape {final_embedding.shape}")
+            # Extract media and metadata
+            from llava.utils.media import extract_media
+            from llava.mm_utils import process_sounds, process_sound_masks
 
-            # Verify dimensions match the model config
-            if final_embedding.shape[0] != encoder_hidden_size:
-                raise ValueError(f"Embedding size {final_embedding.shape[0]} doesn't match expected {encoder_hidden_size}")
+            conversation = [{"from": "human", "value": [sound]}]
+            media, media_meta = extract_media(conversation, self.model_single.config)
 
-            # Convert to CPU and then to Python list
-            embedding_vector = final_embedding.cpu().float().tolist()
+            print(f"\n[STEP 1] Media extraction complete")
+            print(f"  - media['sound'] type: {type(media['sound'])}")
+            print(f"  - media['sound'] length: {len(media['sound'])}")
+            print(f"  - media['sound'][0] type: {type(media['sound'][0])}")
 
-            print(f"[DEBUG] Final embedding_vector type: {type(embedding_vector)}")
-            print(f"[DEBUG] Final embedding_vector length: {len(embedding_vector)}")
-            print(f"[DEBUG] First 5 values: {embedding_vector[:5]}")
+            # Deep inspection of the structure
+            if isinstance(media["sound"][0], list):
+                print(f"  - media['sound'][0] is a LIST with length: {len(media['sound'][0])}")
+                if len(media["sound"][0]) > 0:
+                    print(f"  - media['sound'][0][0] type: {type(media['sound'][0][0])}")
+                    if isinstance(media["sound"][0][0], list):
+                        print(f"  - media['sound'][0][0] is a LIST with length: {len(media['sound'][0][0])}")
 
-            # Final validation - must be a flat list
-            if not isinstance(embedding_vector, list):
-                raise ValueError(f"Expected embedding_vector to be a list, got {type(embedding_vector)}")
-            if len(embedding_vector) != encoder_hidden_size:
-                raise ValueError(f"Final embedding size {len(embedding_vector)} doesn't match expected {encoder_hidden_size}")
-            # Check it's not nested
-            if any(isinstance(x, (list, tuple)) for x in embedding_vector[:10]):
-                raise ValueError("Embedding vector contains nested lists! This should be a flat 1D array")
+            # Process the sound features and masks
+            print(f"\n[STEP 2] Processing sounds and masks...")
+            sounds = process_sounds(media["sound"])
+            print(f"  - After process_sounds type: {type(sounds)}")
+            print(f"  - After process_sounds shape: {sounds.shape if isinstance(sounds, torch.Tensor) else 'NOT A TENSOR'}")
 
-        return embedding_vector
+            sounds = sounds.half()
+            print(f"  - After .half() shape: {sounds.shape}")
+
+            sound_feature_masks = process_sound_masks(media_meta["sound_feature_masks"])
+            print(f"  - sound_feature_masks shape: {sound_feature_masks.shape if isinstance(sound_feature_masks, torch.Tensor) else 'NOT A TENSOR'}")
+
+            sound_feature_masks = sound_feature_masks.half()
+
+            # Extract raw encoder features (before mm_projector)
+            with torch.no_grad():
+                print(f"\n[STEP 3] Getting sound tower...")
+                sound_tower = self.model_single.get_sound_tower()
+                encoder_hidden_size = sound_tower.hidden_size
+                print(f"  - Encoder hidden size from config: {encoder_hidden_size}")
+
+                print(f"\n[STEP 4] Calling sound_tower(sounds, masks)...")
+                print(f"  - Input sounds.shape: {sounds.shape}")
+                print(f"  - Input sounds.dtype: {sounds.dtype}")
+                print(f"  - Input masks.shape: {sound_feature_masks.shape}")
+
+                # Call the encoder
+                raw_features = sound_tower(sounds, sound_feature_masks)
+
+                print(f"\n[STEP 5] Analyzing raw encoder output...")
+                print(f"  - Type: {type(raw_features)}")
+
+                # Handle different return types
+                if isinstance(raw_features, list):
+                    print(f"  - OUTPUT IS A LIST with {len(raw_features)} elements")
+                    for i, item in enumerate(raw_features):
+                        if isinstance(item, torch.Tensor):
+                            print(f"    - List[{i}] is Tensor with shape: {item.shape}")
+                        else:
+                            print(f"    - List[{i}] is {type(item)}")
+
+                    # Stack the list into a tensor
+                    if all(isinstance(item, torch.Tensor) for item in raw_features):
+                        raw_features = torch.stack(raw_features, dim=0)
+                        print(f"  - Stacked into tensor with shape: {raw_features.shape}")
+                    else:
+                        return json.dumps({"error": f"sound_tower returned list with non-tensor elements: {[type(x) for x in raw_features]}"})
+
+                elif isinstance(raw_features, torch.Tensor):
+                    print(f"  - OUTPUT IS A TENSOR")
+                    print(f"  - Shape: {raw_features.shape}")
+                    print(f"  - Ndim: {raw_features.ndim}")
+                    print(f"  - Dtype: {raw_features.dtype}")
+                else:
+                    return json.dumps({"error": f"sound_tower returned unexpected type: {type(raw_features)}"})
+
+                # Now we should have a tensor - analyze and pool
+                print(f"\n[STEP 6] Pooling strategy based on shape: {raw_features.shape}")
+
+                if raw_features.ndim == 4:
+                    # Shape might be [batch, num_windows, seq_len, hidden_size]
+                    batch, num_windows, seq_len, hidden_size = raw_features.shape
+                    print(f"  - 4D tensor: batch={batch}, windows={num_windows}, seq={seq_len}, hidden={hidden_size}")
+                    print(f"  - Pooling: mean over batch, windows, and sequence")
+                    final_embedding = raw_features.mean(dim=[0, 1, 2])  # Pool over all except hidden
+
+                elif raw_features.ndim == 3:
+                    # Shape: [num_windows, seq_len, hidden_size] or [batch, seq_len, hidden]
+                    dim0, dim1, dim2 = raw_features.shape
+                    print(f"  - 3D tensor: dim0={dim0}, dim1={dim1}, dim2={dim2}")
+                    print(f"  - Pooling: mean over dim0 and dim1")
+                    final_embedding = raw_features.mean(dim=[0, 1])
+
+                elif raw_features.ndim == 2:
+                    # Shape: [seq_len, hidden_size]
+                    seq_len, hidden_size = raw_features.shape
+                    print(f"  - 2D tensor: seq={seq_len}, hidden={hidden_size}")
+                    print(f"  - Pooling: mean over sequence")
+                    final_embedding = raw_features.mean(dim=0)
+
+                elif raw_features.ndim == 1:
+                    # Already a 1D vector
+                    print(f"  - Already 1D with size: {raw_features.shape[0]}")
+                    final_embedding = raw_features
+
+                else:
+                    return json.dumps({"error": f"Unexpected tensor dimensionality: {raw_features.ndim} with shape {raw_features.shape}"})
+
+                print(f"\n[STEP 7] After pooling:")
+                print(f"  - final_embedding shape: {final_embedding.shape}")
+                print(f"  - final_embedding ndim: {final_embedding.ndim}")
+
+                # Validate 1D
+                if final_embedding.ndim != 1:
+                    return json.dumps({"error": f"After pooling, expected 1D but got shape {final_embedding.shape}"})
+
+                embedding_size = final_embedding.shape[0]
+                print(f"  - Embedding size: {embedding_size}")
+
+                # Convert to Python list
+                embedding_vector = final_embedding.cpu().float().tolist()
+
+                print(f"\n[STEP 8] Final validation:")
+                print(f"  - Type: {type(embedding_vector)}")
+                print(f"  - Length: {len(embedding_vector)}")
+                print(f"  - First 5 values: {embedding_vector[:5]}")
+
+                # Check for nested structures
+                has_nested = False
+                for i, val in enumerate(embedding_vector[:min(100, len(embedding_vector))]):
+                    if isinstance(val, (list, tuple)):
+                        print(f"  - ERROR: Found nested structure at index {i}: {type(val)}")
+                        has_nested = True
+                        break
+
+                if has_nested:
+                    return json.dumps({"error": f"Embedding contains nested structures! Length: {len(embedding_vector)}, sample: {embedding_vector[:3]}"})
+
+                # Final safety check
+                if not isinstance(embedding_vector, list):
+                    return json.dumps({"error": f"embedding_vector is not a list, it's {type(embedding_vector)}"})
+
+                if len(embedding_vector) == 0:
+                    return json.dumps({"error": "embedding_vector is empty!"})
+
+                if len(embedding_vector) > 10000:
+                    return json.dumps({"error": f"embedding_vector too large: {len(embedding_vector)} dimensions (expected <10k)"})
+
+                # Check all elements are numbers
+                if not all(isinstance(x, (int, float)) for x in embedding_vector[:10]):
+                    return json.dumps({"error": f"embedding_vector contains non-numeric values: {[type(x) for x in embedding_vector[:10]]}"})
+
+                print(f"\n[SUCCESS] Valid 1D embedding with {len(embedding_vector)} dimensions")
+                print("="*80 + "\n")
+
+                return json.dumps({"vector": embedding_vector})
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Exception during embedding extraction: {str(e)}\n{traceback.format_exc()}"
+            print(f"\n[ERROR] {error_msg}")
+            return json.dumps({"error": error_msg})
 
     def predict(
         self,
@@ -264,14 +348,13 @@ class Predictor(BasePredictor):
             if end_time <= start_time:
                 raise ValueError("end_time must be greater than start_time")
 
-        # Extract audio embeddings (1280-dimensional vector)
+        # Extract audio embeddings - returns JSON string
         print("[~] Extracting audio embeddings...")
-        embeddings = self.extract_audio_embeddings(str(audio), start_time, end_time)
-        print(f"[+] Extracted embeddings with {len(embeddings)} dimensions")
+        embeddings_json = self.extract_audio_embeddings(str(audio), start_time, end_time)
 
-        # If embeddings_only mode, return just the embeddings
+        # If embeddings_only mode, return just the embeddings JSON
         if embeddings_only:
-            return ModelOutput(embeddings=embeddings)
+            return ModelOutput(embeddings_json=embeddings_json)
         
         # Create sound object with optional segment timing
         if start_time is not None or end_time is not None:
@@ -326,5 +409,5 @@ class Predictor(BasePredictor):
                 generation_config=generation_config
             )
 
-        # Return both response and embeddings
-        return ModelOutput(response=response, embeddings=embeddings)
+        # Return both response and embeddings JSON
+        return ModelOutput(response=response, embeddings_json=embeddings_json)
