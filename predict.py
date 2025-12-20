@@ -111,8 +111,10 @@ class Predictor(BasePredictor):
         - {"error": "..."} if something went wrong
         """
         import json
+        debug_info = []
 
         try:
+            debug_info.append("Starting extraction")
 
             # Create sound object with optional segment timing
             if start_time is not None or end_time is not None:
@@ -143,66 +145,139 @@ class Predictor(BasePredictor):
 
             # Extract raw encoder features
             with torch.no_grad():
+                debug_info.append("Getting sound tower")
                 sound_tower = self.model_single.get_sound_tower()
                 encoder_hidden_size = sound_tower.hidden_size
+                debug_info.append(f"Encoder hidden_size: {encoder_hidden_size}")
 
                 # Call the encoder
+                debug_info.append(f"Calling encoder with sounds.shape={sounds.shape}, masks.shape={sound_feature_masks.shape}")
                 raw_features = sound_tower(sounds, sound_feature_masks)
 
                 # Handle list output (convert to tensor)
                 if isinstance(raw_features, list):
+                    debug_info.append(f"Encoder returned LIST with {len(raw_features)} items")
                     if not all(isinstance(item, torch.Tensor) for item in raw_features):
-                        return json.dumps({"error": f"Encoder returned list with non-tensors"})
+                        return json.dumps({"error": f"Encoder returned list with non-tensors", "debug": debug_info})
+                    debug_info.append(f"Stacking list items, first item shape: {raw_features[0].shape}")
                     raw_features = torch.stack(raw_features, dim=0)
+                    debug_info.append(f"After stacking: {raw_features.shape}")
 
                 if not isinstance(raw_features, torch.Tensor):
-                    return json.dumps({"error": f"Encoder output not a tensor: {type(raw_features)}"})
+                    return json.dumps({"error": f"Encoder output not a tensor: {type(raw_features)}", "debug": debug_info})
+
+                debug_info.append(f"Encoder output shape: {raw_features.shape}, ndim: {raw_features.ndim}")
 
                 # Pool to get single vector based on dimensionality
                 if raw_features.ndim == 4:
+                    debug_info.append(f"4D pooling: {raw_features.shape} -> mean(dim=[0,1,2])")
                     final_embedding = raw_features.mean(dim=[0, 1, 2])
                 elif raw_features.ndim == 3:
+                    debug_info.append(f"3D pooling: {raw_features.shape} -> mean(dim=[0,1])")
                     final_embedding = raw_features.mean(dim=[0, 1])
                 elif raw_features.ndim == 2:
+                    debug_info.append(f"2D pooling: {raw_features.shape} -> mean(dim=0)")
                     final_embedding = raw_features.mean(dim=0)
                 elif raw_features.ndim == 1:
+                    debug_info.append(f"Already 1D: {raw_features.shape}")
                     final_embedding = raw_features
                 else:
-                    return json.dumps({"error": f"Unexpected shape: {raw_features.shape}"})
+                    return json.dumps({"error": f"Unexpected shape: {raw_features.shape}", "debug": debug_info})
 
-                # Validate 1D
+                debug_info.append(f"After pooling: shape={final_embedding.shape}, ndim={final_embedding.ndim}")
+
+                # CRITICAL: Verify tensor is 1D BEFORE converting to list
                 if final_embedding.ndim != 1:
-                    return json.dumps({"error": f"Pooling failed: shape {final_embedding.shape}"})
+                    return json.dumps({
+                        "error": f"TENSOR NOT 1D! Shape: {final_embedding.shape}, ndim: {final_embedding.ndim}. Pooling failed.",
+                        "debug": debug_info
+                    })
 
-                # Convert to list
+                # Get the size
+                embed_size = final_embedding.shape[0]
+                debug_info.append(f"Tensor size: {embed_size}")
+                if embed_size > 10000:
+                    return json.dumps({
+                        "error": f"Tensor too large: {embed_size} elements before tolist()",
+                        "debug": debug_info
+                    })
+
+                # Convert to list - this should create a FLAT list since tensor is 1D
+                debug_info.append("Calling tolist()")
                 embedding_vector = final_embedding.cpu().float().tolist()
+                debug_info.append(f"After tolist(): type={type(embedding_vector)}, len={len(embedding_vector) if isinstance(embedding_vector, list) else 'N/A'}")
 
-                # Validate
+                # DEEP VALIDATION - check EVERY element
+                def check_nested(obj, path="root"):
+                    """Recursively check for any nested structures"""
+                    if isinstance(obj, (list, tuple)):
+                        for i, item in enumerate(obj):
+                            if isinstance(item, (list, tuple)):
+                                return f"NESTED at {path}[{i}]: {type(item)}"
+                            result = check_nested(item, f"{path}[{i}]")
+                            if result:
+                                return result
+                    return None
+
+                nested_check = check_nested(embedding_vector)
+                if nested_check:
+                    return json.dumps({
+                        "error": f"NESTED STRUCTURE FOUND: {nested_check}. Type: {type(embedding_vector)}, Len: {len(embedding_vector) if isinstance(embedding_vector, list) else 'N/A'}",
+                        "debug": debug_info
+                    })
+
+                # Validate it's actually a flat list
                 if not isinstance(embedding_vector, list):
-                    return json.dumps({"error": f"Not a list: {type(embedding_vector)}"})
+                    return json.dumps({
+                        "error": f"tolist() returned {type(embedding_vector)}, not list!",
+                        "debug": debug_info
+                    })
 
                 if len(embedding_vector) == 0:
-                    return json.dumps({"error": "Empty embedding"})
+                    return json.dumps({
+                        "error": "Empty embedding after tolist()",
+                        "debug": debug_info
+                    })
 
                 if len(embedding_vector) > 10000:
-                    return json.dumps({"error": f"Too large: {len(embedding_vector)} dims"})
+                    return json.dumps({
+                        "error": f"List too large: {len(embedding_vector)} elements",
+                        "debug": debug_info
+                    })
 
-                # Check for nested structures
-                if any(isinstance(x, (list, tuple)) for x in embedding_vector[:min(100, len(embedding_vector))]):
-                    return json.dumps({"error": "Nested structures detected"})
+                # Check first 10 elements are plain numbers
+                for i in range(min(10, len(embedding_vector))):
+                    val = embedding_vector[i]
+                    if not isinstance(val, (int, float)):
+                        return json.dumps({
+                            "error": f"Element [{i}] is {type(val)}, not a number!",
+                            "debug": debug_info
+                        })
+                    if isinstance(val, (list, tuple)):
+                        return json.dumps({
+                            "error": f"Element [{i}] is a NESTED {type(val)}!",
+                            "debug": debug_info
+                        })
 
-                # Check numeric
-                if not all(isinstance(x, (int, float)) for x in embedding_vector[:10]):
-                    return json.dumps({"error": "Non-numeric values found"})
+                debug_info.append(f"SUCCESS: Valid flat embedding with {len(embedding_vector)} dimensions")
 
                 # Return success
-                return json.dumps({"vector": embedding_vector})
+                return json.dumps({
+                    "vector": embedding_vector,
+                    "debug": debug_info
+                })
 
         except Exception as e:
             import traceback
-            error_msg = f"Exception during embedding extraction: {str(e)}\n{traceback.format_exc()}"
-            print(f"\n[ERROR] {error_msg}")
-            return json.dumps({"error": error_msg})
+            error_msg = f"Exception: {str(e)}"
+            trace = traceback.format_exc()
+            debug_info.append(f"EXCEPTION: {error_msg}")
+            debug_info.append(f"Traceback: {trace}")
+            return json.dumps({
+                "error": error_msg,
+                "traceback": trace,
+                "debug": debug_info
+            })
 
     def predict(
         self,
@@ -272,11 +347,24 @@ class Predictor(BasePredictor):
                 logs.append("ERROR: Invalid return from extract_audio_embeddings")
                 embeddings_json = json.dumps({"error": "extract_audio_embeddings returned invalid value"})
             else:
-                logs.append(f"embeddings_json preview: {embeddings_json[:200]}")
+                # Try to parse and get debug info
+                try:
+                    parsed = json.loads(embeddings_json)
+                    if "debug" in parsed:
+                        logs.append("=== EXTRACTION DEBUG INFO ===")
+                        for debug_line in parsed["debug"]:
+                            logs.append(f"  {debug_line}")
+                        logs.append("=== END DEBUG INFO ===")
+                    if "error" in parsed:
+                        logs.append(f"EXTRACTION ERROR: {parsed['error']}")
+                    elif "vector" in parsed:
+                        logs.append(f"SUCCESS: Got vector with {len(parsed['vector'])} dimensions")
+                except:
+                    logs.append(f"embeddings_json preview: {embeddings_json[:200]}")
         except Exception as e:
             import traceback
             trace = traceback.format_exc()
-            logs.append(f"EXCEPTION: {str(e)}")
+            logs.append(f"EXCEPTION in predict: {str(e)}")
             logs.append(f"Traceback: {trace}")
             embeddings_json = json.dumps({"error": f"Exception: {str(e)}"})
 
