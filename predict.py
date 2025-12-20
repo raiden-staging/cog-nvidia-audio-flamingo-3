@@ -277,7 +277,12 @@ class Predictor(BasePredictor):
     def predict(
         self,
         audio_files: str = Input(
-            description='JSON array of audio file URLs or paths. Example: ["https://example.com/audio1.mp3", "https://example.com/audio2.wav"]. Accepts http/https URLs or local paths.'
+            description='JSON array of audio file URLs or paths. Example: ["https://example.com/audio1.mp3", "https://example.com/audio2.wav"]. Accepts http/https URLs or local paths.',
+            default=""
+        ),
+        audio: Path = Input(
+            description="DEPRECATED: Single audio file (kept for backward compatibility). Use audio_files instead.",
+            default=None
         ),
         prompt: str = Input(
             description="Question or instruction about the audio. Applied to all audio files.",
@@ -321,6 +326,11 @@ class Predictor(BasePredictor):
         results = []
 
         try:
+            # Handle backward compatibility: if audio provided but not audio_files, convert to array
+            if audio is not None and (not audio_files or not audio_files.strip()):
+                audio_files = json.dumps([str(audio)])
+                logs_lines.append("Using deprecated 'audio' parameter - converted to array format")
+
             # Parse audio_files JSON array
             audio_urls = json.loads(audio_files)
 
