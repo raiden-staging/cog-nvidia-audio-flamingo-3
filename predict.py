@@ -205,16 +205,54 @@ class Predictor(BasePredictor):
                 # Convert to list - this should create a FLAT list since tensor is 1D
                 debug_info.append("Calling tolist()")
                 embedding_vector = final_embedding.cpu().float().tolist()
-                debug_info.append(f"After tolist(): type={type(embedding_vector)}, len={len(embedding_vector) if isinstance(embedding_vector, list) else 'N/A'}")
+                debug_info.append(f"After tolist(): type={type(embedding_vector)}")
 
-                # DEEP VALIDATION - check EVERY element
-                def check_nested(obj, path="root"):
-                    """Recursively check for any nested structures"""
+                # IMMEDIATE CHECK: Is it even a list?
+                if not isinstance(embedding_vector, list):
+                    return json.dumps({
+                        "error": f"tolist() returned {type(embedding_vector)}, not a list!",
+                        "debug": debug_info
+                    })
+
+                debug_info.append(f"List length: {len(embedding_vector)}")
+
+                # IMMEDIATE CHECK: First element - is it a number or nested?
+                if len(embedding_vector) > 0:
+                    first_elem = embedding_vector[0]
+                    debug_info.append(f"First element type: {type(first_elem)}")
+                    if isinstance(first_elem, (list, tuple)):
+                        return json.dumps({
+                            "error": f"FIRST ELEMENT IS NESTED! Type: {type(first_elem)}, Len: {len(first_elem) if hasattr(first_elem, '__len__') else 'N/A'}. This is a 2D+ array!",
+                            "debug": debug_info
+                        })
+
+                # DEEP VALIDATION - count total elements recursively
+                def count_total_elements(obj):
+                    """Count total scalar elements including nested"""
                     if isinstance(obj, (list, tuple)):
-                        for i, item in enumerate(obj):
+                        return sum(count_total_elements(item) for item in obj)
+                    else:
+                        return 1
+
+                total_elements = count_total_elements(embedding_vector)
+                debug_info.append(f"Total elements (recursive count): {total_elements}")
+
+                if total_elements != len(embedding_vector):
+                    return json.dumps({
+                        "error": f"NESTED DETECTED! Outer len={len(embedding_vector)} but total elements={total_elements}. This is multi-dimensional!",
+                        "debug": debug_info
+                    })
+
+                # Check for nested structures
+                def check_nested(obj, path="root", depth=0, max_depth=2):
+                    """Recursively check for any nested structures"""
+                    if depth > max_depth:
+                        return None
+                    if isinstance(obj, (list, tuple)):
+                        for i, item in enumerate(obj[:100]):  # Check first 100
                             if isinstance(item, (list, tuple)):
-                                return f"NESTED at {path}[{i}]: {type(item)}"
-                            result = check_nested(item, f"{path}[{i}]")
+                                return f"NESTED at {path}[{i}] depth={depth}: {type(item)} len={len(item) if hasattr(item, '__len__') else '?'}"
+                            result = check_nested(item, f"{path}[{i}]", depth+1, max_depth)
                             if result:
                                 return result
                     return None
@@ -222,7 +260,7 @@ class Predictor(BasePredictor):
                 nested_check = check_nested(embedding_vector)
                 if nested_check:
                     return json.dumps({
-                        "error": f"NESTED STRUCTURE FOUND: {nested_check}. Type: {type(embedding_vector)}, Len: {len(embedding_vector) if isinstance(embedding_vector, list) else 'N/A'}",
+                        "error": f"NESTED STRUCTURE: {nested_check}",
                         "debug": debug_info
                     })
 
@@ -260,6 +298,18 @@ class Predictor(BasePredictor):
                         })
 
                 debug_info.append(f"SUCCESS: Valid flat embedding with {len(embedding_vector)} dimensions")
+
+                # CRITICAL: Check JSON size BEFORE returning to prevent crashes
+                test_json = json.dumps({"vector": embedding_vector})
+                json_size_bytes = len(test_json)
+                json_size_kb = json_size_bytes / 1024
+                debug_info.append(f"JSON size: {json_size_kb:.1f} KB")
+
+                if json_size_bytes > 500000:  # 500KB limit
+                    return json.dumps({
+                        "error": f"RESULT TOO LARGE: {json_size_kb:.1f} KB ({json_size_bytes} bytes). Vector len={len(embedding_vector)}. This means validation failed!",
+                        "debug": debug_info
+                    })
 
                 # Return success
                 return json.dumps({
